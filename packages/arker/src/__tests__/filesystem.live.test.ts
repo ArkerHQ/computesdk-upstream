@@ -50,7 +50,7 @@ function fingerprint(content: string | Uint8Array) {
 
 describe.skipIf(!process.env.ARKER_API_KEY)('Arker focused final verification (live)', () => {
   it('roundtrips the isolated 128 MiB-labelled payload with native, relative and absolute read hashes', async () => {
-    const box = await arker({ platforms: ['graviton4'] }).instances.create({ templateId: 'ubuntu-small' });
+    const box = await arker({ platforms: process.env.ARKER_PLATFORMS?.split(',') }).instances.create({ templateId: 'ubuntu-small' });
     const vm = box.getInstance();
     console.log('ARKER_FINAL filesystem source', vm.id);
     try {
@@ -87,7 +87,7 @@ describe.skipIf(!process.env.ARKER_API_KEY)('Arker focused final verification (l
   }, 300_000);
 
   it('verifies five concurrent restores after source deletion through both adapter and native fork', async () => {
-    const provider = arker({ platforms: ['graviton4'] });
+    const provider = arker({ platforms: process.env.ARKER_PLATFORMS?.split(',') });
     const source = await provider.instances.create({ templateId: 'ubuntu-small' });
     const sourceVm = source.getInstance();
     console.log('ARKER_FINAL fanout source', sourceVm.id);
