@@ -66,8 +66,7 @@ describe('Arker standard size mapping (mock)', () => {
 });
 
 describe.skipIf(!live)('Arker standard sizes (live)', () => {
-  // The benchmarks pin graviton4; check every size boots at its shape there.
-  const provider = arker({ platforms: ['graviton4'] });
+  const provider = arker({ platforms: process.env.ARKER_PLATFORMS?.split(',') ?? ['graviton4'] });
 
   it.each(profiles)('boots %s at %i vCPU / %i MiB', async (sizeClass, vcpu, memory) => {
     const instance = await provider.instances.create({ sizeClass });
