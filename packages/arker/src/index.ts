@@ -280,8 +280,14 @@ export const arker = defineProvider<VM, ArkerConfig>({
 
       list: async (config: ArkerConfig) => {
         const client = makeClient(config);
-        const { vms } = await client.listVms();
-        return vms.map((vm) => ({ instance: vm, instanceId: vm.id }));
+        const instances = [];
+        let cursor: string | undefined;
+        do {
+          const page = await client.listVms(cursor ? { cursor } : {});
+          instances.push(...page.vms.map((vm) => ({ instance: vm, instanceId: vm.id })));
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor);
+        return instances;
       },
 
       destroy: async (config: ArkerConfig, sandboxId: string) => {
