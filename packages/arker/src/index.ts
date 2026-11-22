@@ -628,8 +628,8 @@ export const arker = defineProvider<VM, ArkerConfig>({
         };
       },
 
-      // Arker's VM listing omits names and caps its pages, so snapshot forks
-      // can't be told apart from other VMs; keep the ids create() returns.
+      // Snapshot metadata is not a separate backend record; retain the IDs
+      // create() returns rather than relying on a reconstructible inventory.
       list: async (_config: ArkerConfig, _options?: ListSnapshotsOptions): Promise<ArkerSnapshot[]> => {
         throw new Error('Arker cannot list snapshots: its VM listing does not identify snapshot forks');
       },
