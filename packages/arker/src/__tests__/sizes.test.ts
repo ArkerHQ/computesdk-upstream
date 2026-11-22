@@ -26,6 +26,7 @@ describe('Arker standard size mapping (mock)', () => {
     const result = await arker(config).instances.create({ sizeClass, name: 'job' });
     expect(fork).toHaveBeenCalledWith({
       source_vm_name: goldens[sizeClass], name: 'job', platforms: ['graviton4'], resources: { vcpu, memory_mib: memory },
+      policies: { rules: { 'computesdk-runtime': { type: 'runtime', action: 'keep_running' } } },
     });
     expect(result.sizing).toEqual({ requested: { sizeClass, vcpus: vcpu, memoryMiB: memory }, resolved: { vcpus: vcpu, memoryMiB: memory }, provenance: 'adapter-declared' });
   });
@@ -56,10 +57,10 @@ describe('Arker standard size mapping (mock)', () => {
       .rejects.toMatchObject({ name: 'InstanceSizeError', code: 'unsupported', fallback: false });
   });
 
-  it('leaves unsized creates unchanged', async () => {
+  it('keeps default resources for unsized creates', async () => {
     const fork = mockFork();
     const result = await arker(config).instances.create({ name: 'plain' });
-    expect(fork.mock.calls[0][0]).toEqual({ source_vm_name: 'ubuntu-small', name: 'plain', platforms: ['graviton4'] });
+    expect(fork.mock.calls[0][0]).toEqual({ source_vm_name: 'ubuntu-small', name: 'plain', platforms: ['graviton4'], policies: { rules: { 'computesdk-runtime': { type: 'runtime', action: 'keep_running' } } } });
     expect(result.sizing).toBeUndefined();
   });
 });

@@ -7,9 +7,9 @@
 
 import { randomUUID } from 'node:crypto';
 import { Arker, ArkerError, VM } from '@arker-ai/sdk';
-import { defineProvider, escapeShellArg, InstanceSizeError } from '@computesdk/provider';
+import { defineProvider, escapeShellArg, InstanceSizeError, isUnifiedVolumeMounts } from '@computesdk/provider';
 
-import type { PatchVmRequest, PolicyDoc, PolicyEntry, ResourcesInput, RunOptions, SyncWriteResponse } from '@arker-ai/sdk';
+import type { PatchVmRequest, PolicyEntry, ResourcesInput, RunOptions, SyncWriteResponse } from '@arker-ai/sdk';
 import type {
   CommandResult,
   InstanceInfo,
@@ -101,6 +101,7 @@ const WRITE_CHUNK_BYTES = 3 * 256 * 1024;
 
 /** Name prefix marking VMs forked by `snapshot.create`. */
 const SNAPSHOT_PREFIX = 'computesdk-snapshot-';
+const RUNTIME_RULE = 'computesdk-runtime';
 
 export interface ArkerSnapshot {
   /** ID of the forked VM; pass it as `snapshotId` to restore. */
@@ -112,6 +113,7 @@ export interface ArkerSnapshot {
 
 /** Id of the schedule rule `pause` writes to suspend a VM. */
 const PAUSE_RULE = 'computesdk-pause';
+const LIFETIME_RULE = 'computesdk-lifetime';
 /** How long `pause` waits for the suspend to take effect. */
 const PAUSE_TIMEOUT_MS = 60_000;
 
@@ -124,6 +126,12 @@ const patchRule = (vm: VM, id: string, rule: Record<string, unknown> | null) =>
   vm.update({ policies: { rules: { [id]: rule } } } as unknown as PatchVmRequest);
 
 const isNotFound = (err: unknown): boolean => err instanceof ArkerError && err.status === 404;
+
+function volumeId(volume: string | { id?: string }): string {
+  const id = typeof volume === 'string' ? volume : volume.id;
+  if (!id) throw new Error('Arker volumes are addressed by filesystem id');
+  return id;
+}
 
 /** True when an inbound rule already serves `port`. */
 const exposesPort = (rule: PolicyEntry, port: number): boolean =>
@@ -161,6 +169,9 @@ export const arker = defineProvider<VM, ArkerConfig>({
     if (options?.snapshotId) {
       return { status: 'unknown', reason: 'A snapshot fork keeps its source VM\'s resource bounds, which this adapter has not verified.' };
     }
+    if (options?.image !== undefined) {
+      return { status: 'unknown', reason: 'OCI image resource bounds have not been verified; use native resources instead of sizeClass.' };
+    }
     const pinned = options?.templateId || config.source || env('ARKER_SOURCE');
     if (pinned) {
       if (GOLDEN_BOUNDS[pinned] && !fitsGolden(pinned, vcpus, memoryMiB)) {
@@ -180,6 +191,21 @@ export const arker = defineProvider<VM, ArkerConfig>({
       // --- Collection operations ---
 
       create: async (config: ArkerConfig, options?: CreateInstanceOptions) => {
+        const image = options?.image;
+        if (image !== undefined && (typeof image !== 'string' || !image.trim())) {
+          throw new Error('Arker image must be a nonempty OCI image reference');
+        }
+        if (image !== undefined && (options?.snapshotId || options?.templateId)) {
+          throw new Error('Arker image cannot be combined with snapshotId or templateId');
+        }
+        const mounts = options?.volumes ?? [];
+        if (!Array.isArray(mounts) || (mounts.length > 0 && !isUnifiedVolumeMounts(mounts))) {
+          throw new Error('Arker volumes must be VolumeMount entries');
+        }
+        const requests = mounts.map((mount) => {
+          if (mount.readOnly) throw new Error('Arker does not support read-only volume mounts');
+          return { filesystemId: volumeId(mount.volume), path: mount.mountPath };
+        });
         const client = makeClient(config);
         const name = options?.name ?? null;
         
@@ -188,6 +214,19 @@ export const arker = defineProvider<VM, ArkerConfig>({
           env('ARKER_PLATFORMS')?.split(',').map((p) => p.trim()).filter(Boolean);
         const resources = options?.resources as ResourcesInput | undefined;
         const source = options?.templateId || config.source || env('ARKER_SOURCE') || DEFAULT_SOURCE;
+        const timeout = options?.timeout;
+        if (timeout !== undefined && (!Number.isFinite(timeout) || timeout < 0 || timeout > 2_592_000_000)) {
+          throw new Error('Arker instance timeout must be between 0 and 2592000000 milliseconds (30 days)');
+        }
+        const policies = {
+          rules: {
+            [RUNTIME_RULE]: { type: 'runtime', action: 'keep_running' },
+            ...(timeout === undefined ? {} : { [LIFETIME_RULE]: timeout === 0 ? null : {
+            type: 'schedule' as const, after_created: Math.ceil(timeout / 1000), action: 'delete' as const,
+            } }),
+          },
+        } as unknown as Parameters<Arker['fork']>[0]['policies'];
+        const forkOptions = { name, ...(resources ? { resources } : {}), policies };
 
         // SDK 1.x takes a single options object keyed by the wire schema
         // (`source_vm_id` / `source_vm_name`); the old `fork(name, opts)`
@@ -195,12 +234,11 @@ export const arker = defineProvider<VM, ArkerConfig>({
         let vm: VM;
         try {
           vm = options?.snapshotId
-            ? await client.fork({ source_vm_id: options.snapshotId, name, ...(resources ? { resources } : {}) })
+            ? await client.fork({ source_vm_id: options.snapshotId, ...forkOptions })
             : await client.fork({
-                source_vm_name: source,
-                name,
+                ...(image === undefined ? { source_vm_name: source } : { image }),
+                ...forkOptions,
                 ...(platforms?.length ? { platforms } : {}),
-                ...(resources ? { resources } : {}),
               });
         } catch (err) {
           // The source VM bounds the resources a fork can take; Arker enforces them.
@@ -214,6 +252,18 @@ export const arker = defineProvider<VM, ArkerConfig>({
           throw err;
         }
 
+        try {
+          for (const request of requests) await vm.createMount(request);
+        } catch (error) {
+          try {
+            await vm.delete();
+          } catch (cleanupError) {
+            throw Object.assign(new Error(`Arker mount failed and VM ${vm.id} cleanup failed`), {
+              cause: error, cleanupError,
+            });
+          }
+          throw error;
+        }
         return { instance: vm, instanceId: vm.id };
       },
 
@@ -245,6 +295,25 @@ export const arker = defineProvider<VM, ArkerConfig>({
       },
 
       // --- Instance operations ---
+
+      attachVolume: async (sandbox, volume, mountPath) => {
+        await sandbox.createMount({ filesystemId: volumeId(volume), path: mountPath });
+      },
+      detachVolume: async (sandbox, volume, mountPath) => {
+        const id = volumeId(volume);
+        const matchingMounts: string[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await sandbox.listMounts({ filesystemId: id, ...(cursor ? { cursor } : {}) });
+          for (const mount of page.mounts) {
+            if (mount.filesystem_id === id && (mountPath === undefined || mount.path === mountPath)) {
+              matchingMounts.push(mount.mount_id);
+            }
+          }
+          cursor = page.next_cursor ?? undefined;
+        } while (cursor);
+        for (const mountId of matchingMounts) await sandbox.deleteMount(mountId);
+      },
 
       runCommand: async (sandbox: VM, command: string, options?: RunCommandOptions): Promise<CommandResult> => {
         const startTime = Date.now();
@@ -308,10 +377,22 @@ export const arker = defineProvider<VM, ArkerConfig>({
         const { port } = options;
         const current = await sandbox.getPolicies();
         const rules = current.policies ?? [];
-        let doc: PolicyDoc = current;
+        let doc = current;
         if (!rules.some((rule) => exposesPort(rule, port))) {
-          const rule: PolicyEntry = { type: 'inbound', match: { ports: [port] }, action: 'allow', auth: 'open' };
-          doc = await sandbox.setPolicies({ policies: [...rules, rule], ...(current.secrets ? { secrets: current.secrets } : {}) });
+          // The legacy list contains network rules only. Replacing it would
+          // silently remove runtime and lifetime rules, so patch one named
+          // rule instead. Append below existing rules so a public allow cannot
+          // bypass a customer's higher-precedence deny or authentication rule.
+          const vm = await sandbox.refresh();
+          const priorities = Object.values(vm.policies?.rules ?? {})
+            .filter((rule) => rule.type === 'inbound')
+            .map((rule) => 'priority' in rule ? rule.priority : 0);
+          const priority = priorities.length === 0 ? 1_000_000 : Math.min(...priorities) - 1;
+          if (priority < 0) throw new Error('Arker cannot add a port below existing inbound rules: priority zero is already occupied');
+          await patchRule(sandbox, `computesdk-port-${port}`, {
+            type: 'inbound', priority, match: { ports: [port] }, action: 'allow', auth: 'open',
+          });
+          doc = await sandbox.getPolicies();
         }
         const base = doc.hostname ?? current.hostname;
         if (!base) throw new Error(`Arker did not return an inbound hostname for VM ${sandbox.id}`);
@@ -481,6 +562,44 @@ export const arker = defineProvider<VM, ArkerConfig>({
       },
     },
 
+    volume: {
+      create: async (config, options) => {
+        const filesystem = await makeClient(config).createFilesystem({ name: options.name });
+        return { id: filesystem.filesystem_id, name: filesystem.name, native: filesystem };
+      },
+      get: async (config, id) => {
+        try {
+          const filesystem = await makeClient(config).getFilesystem(id);
+          return { id: filesystem.filesystem_id, name: filesystem.name, native: filesystem };
+        } catch (error) {
+          if (isNotFound(error)) return null;
+          throw error;
+        }
+      },
+      list: async (config, options) => {
+        const client = makeClient(config);
+        const volumes = [];
+        let cursor: string | undefined;
+        do {
+          const page = await client.listFilesystems({
+            ...(cursor ? { cursor } : {}),
+            ...(options?.limit === undefined ? {} : { limit: options.limit - volumes.length }),
+          });
+          volumes.push(...page.filesystems.map((filesystem) => ({
+            id: filesystem.filesystem_id, name: filesystem.name, native: filesystem,
+          })));
+          cursor = page.next_cursor ?? undefined;
+        } while (cursor && (options?.limit === undefined || volumes.length < options.limit));
+        return options?.limit === undefined ? volumes : volumes.slice(0, options.limit);
+      },
+      delete: async (config, id) => {
+        try {
+          await makeClient(config).deleteFilesystem(id);
+        } catch (error) {
+          if (!isNotFound(error)) throw error;
+        }
+      },
+    },
     // A snapshot is a warm fork of the VM (disk + memory). Restore by passing
     // its id as `snapshotId` to create(), which forks from it again.
     snapshot: {
@@ -491,7 +610,10 @@ export const arker = defineProvider<VM, ArkerConfig>({
       create: async (config: ArkerConfig, instanceId: string, options?: CreateSnapshotOptions): Promise<ArkerSnapshot> => {
         const client = makeClient(config);
         const name = `${SNAPSHOT_PREFIX}${options?.name ? `${options.name}-` : ''}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-        const vm = await client.vm(instanceId).fork({ name, description: `snapshot of ${instanceId}` });
+        const vm = await client.vm(instanceId).fork({
+          name, description: `snapshot of ${instanceId}`,
+          policies: { rules: { [LIFETIME_RULE]: null, [RUNTIME_RULE]: null } },
+        });
         return {
           id: vm.id,
           provider: 'arker',

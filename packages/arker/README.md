@@ -50,10 +50,13 @@ const sandbox = await sdk.sandbox.create();
 
 ## How sandboxes are created
 
-Arker disables direct VM creation — every sandbox is **forked from a source VM**. `create()` forks the `ubuntu-small` golden (Node.js + Python preinstalled) by default. The source can be chosen two ways:
+Sandboxes opt into Arker's `runtime: keep_running` policy so background processes continue between commands. Compute stays allocated and billed until an explicit pause, destruction, instance deadline, or host/resource-pressure suspension. This requires an Arker server supporting runtime policy rules; deploy that server support before releasing this adapter update. Snapshot records remove the adapter's keep-running and lifetime rules, and restored instances receive their own execution policy.
+
+`create()` forks the `ubuntu-small` golden (Node.js + Python preinstalled) by default. Choose an existing VM or boot a root filesystem from an OCI image:
 
 - **By name** — a golden/template, via `source` in config or `templateId` in create options.
 - **By id** — a specific existing VM, via `snapshotId` in create options. The `instanceId` returned by `create()` is itself a valid source, so this branches a sandbox from its current state (Arker's equivalent of a snapshot restore). If both are given, `snapshotId` wins.
+- **By image** — `image: 'ubuntu:24.04'` boots an OCI image through Arker's native image fork. Images cannot be combined with `templateId` or `snapshotId`. Use native `resources` for image sizing; standard `sizeClass` bounds have not been verified for arbitrary images.
 
 ```typescript
 // Default: forks the `ubuntu-small` golden
@@ -70,6 +73,12 @@ const forked = await sdk.sandbox.create({ snapshotId: sandbox.instanceId });
 ```
 
 ## Configuration
+
+`create({ timeout })` sets the instance lifetime in milliseconds using an Arker
+scheduled-delete policy, including when restoring a snapshot. Positive lifetimes
+are rounded up to whole seconds, up to 30 days; `0` removes an inherited adapter
+deadline. Omitting `timeout` leaves inherited policies unchanged. Snapshot handles
+themselves do not inherit the adapter's source-instance deadline.
 
 ### Environment Variables
 
@@ -127,6 +136,28 @@ const exists = await sandbox.filesystem.exists('/tmp/hello.txt');
 await sandbox.filesystem.remove('/tmp/hello.txt');
 ```
 
+### Independent Volumes
+
+Volumes use Arker's object-backed shared filesystems. Their bytes are independent of any one VM, and the same volume can be mounted by multiple VMs.
+
+```typescript
+const volume = await sdk.volume.create({ name: 'dataset' });
+const sandbox = await sdk.instances.create({
+  volumes: [{ volume, mountPath: '/mnt/data' }],
+});
+await sandbox.runCommand('echo retained > /mnt/data/value; sync');
+await sandbox.destroy();
+
+const restored = await sdk.instances.create({
+  volumes: [{ volume, mountPath: '/mnt/data' }],
+});
+console.log((await restored.runCommand('cat /mnt/data/value')).stdout);
+await restored.destroy();
+await sdk.volume.delete(volume.id);
+```
+
+Runtime `attachVolume(volume, mountPath)` and `detachVolume(volume, mountPath)` are supported too. Volume references are filesystem IDs or handles returned by `sdk.volume`. Storage is elastic; `sizeBytes` does not reserve capacity. Read-only mounts are not supported and are rejected before VM creation.
+
 ### Sandbox Management
 
 ```typescript
@@ -146,8 +177,8 @@ await sandbox.destroy();
 
 ## Limitations
 
-- **Creation is fork-only** — direct VM creation is disabled; `create()` forks a golden by name (`templateId`/`source`) or an existing VM by id (`snapshotId`). There's no separate snapshot store, but any `instanceId` can be re-forked as a `snapshotId`.
-- **`getUrl` is not supported** — Arker does not expose per-port URLs; `getUrl` throws. VMs forked with network reachability enabled get a stable per-VM hostname — see the [Arker SDK](https://github.com/ArkerHQ/arker-sdk) fork network options.
+- **Snapshots are VM forks** — the adapter keeps a snapshot as an independent VM handle. Deleting the source sandbox does not delete that snapshot; delete it explicitly when finished.
+- **Public ports** — `getUrl` adds a public inbound rule without replacing other policies. Existing higher-precedence deny/authentication rules still apply. If inbound priority zero is already occupied, the adapter refuses to add a lower-precedence rule instead of bypassing it.
 - **`getInfo` status** — always reports `running`; idle sandboxes resume automatically on their next command.
 
 ## Support
