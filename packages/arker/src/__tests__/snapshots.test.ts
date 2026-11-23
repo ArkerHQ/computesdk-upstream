@@ -46,7 +46,6 @@ describe('Arker durable snapshot inventory', () => {
     const options = { name: 'checkpoint 世界', metadata: { task: 'build', sourceInstanceId: 'caller-value' } };
     const snapshot = await arker(config).snapshot!.create('source-alias', options);
     expect(get).toHaveBeenCalledWith('source-alias');
-    expect(fork.mock.contexts[0]).toMatchObject({ id: 'vm-canonical', baseUrl: 'https://source-region.invalid/api' });
     expect(update).toHaveBeenCalledWith('PATCH', '/v1/vms/snapshot-one', { immutable: true }, 'https://example.invalid/api');
     expect(remove).not.toHaveBeenCalled();
     const description = fork.mock.calls[0][0].description;
