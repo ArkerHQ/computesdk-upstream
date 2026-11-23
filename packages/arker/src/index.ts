@@ -9,7 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { Arker, ArkerError, VM } from '@arker-ai/sdk';
 import { defineProvider, escapeShellArg, InstanceSizeError, isUnifiedVolumeMounts, resolveVolumeRef } from '@computesdk/provider';
 
-import type { Filesystem, Mount, PatchVmRequest, PolicyDoc, PolicyEntry, ResourcesInput, RunOptions, SyncWriteResponse } from '@arker-ai/sdk';
+import type { Filesystem, Mount, PatchVmRequest, PolicyEntry, ResourcesInput, RunOptions, SyncWriteResponse } from '@arker-ai/sdk';
 import type {
   CommandResult,
   InstanceInfo,
@@ -41,12 +41,6 @@ const GOLDEN_BOUNDS: Record<string, { maxVcpus: number; minMemoryMiB: number; ma
 };
 /** Same-toolchain goldens a sized create forks from when no source is pinned, smallest first. */
 const SIZED_SOURCES = ['ubuntu-coding', 'ubuntu-coding-8', 'ubuntu-coding-32'];
-/**
- * Public goldens, which have no runs for a fork to copy. (A VM of your own
- * with one of these names is taken for the golden.)
- */
-const PUBLIC_GOLDENS = new Set([DEFAULT_SOURCE, 'ubuntu-full', ...Object.keys(GOLDEN_BOUNDS)]);
-
 const fitsGolden = (name: string, vcpus: number, memoryMiB: number): boolean => {
   const b = GOLDEN_BOUNDS[name];
   return !!b && vcpus <= b.maxVcpus && memoryMiB >= b.minMemoryMiB && memoryMiB <= b.maxMemoryMiB;
@@ -66,17 +60,10 @@ export interface ArkerConfig {
   /** Compute platforms to fork onto, e.g. `['graviton4']`. Falls back to ARKER_PLATFORMS (comma-separated). */
   platforms?: string[];
   /**
-   * Keep each sandbox running between commands for its `timeout`
-   * (5 minutes when unset, `0` for no limit) or until it is
-   * destroyed; a pause suspends it and resume carries on (default `true`).
-   * With `false`, Arker pauses the VM whenever no command is running, which
-   * also freezes anything a command left running in the background, and bills
-   * only while commands run. The hold starts in the background once the
-   * sandbox's first command returns, so it adds nothing to the time to that
-   * command, and only in the process that created the sandbox: one commanded
-   * only from another process (through `getById`) is not held. Until it
-   * starts, or if the calling process exits first, the sandbox behaves as with
-   * `false`.
+   * Keep the VM running between commands using a server-side policy (default
+   * true). False removes the adapter's inherited runtime rule and lets idle
+   * compute pause. Explicit pause, lifetime and host/resource-pressure
+   * suspension still apply; this does not reserve host capacity.
    */
   keepAwake?: boolean;
 }
@@ -122,6 +109,38 @@ const WRITE_CHUNK_BYTES = 3 * 256 * 1024;
 
 /** Name prefix marking VMs forked by `snapshot.create`. */
 const SNAPSHOT_PREFIX = 'computesdk-snapshot-';
+const SNAPSHOT_KIND = 'computesdk.arker.snapshot';
+const RUNTIME_RULE = 'computesdk-runtime';
+
+interface SnapshotRecord {
+  kind: typeof SNAPSHOT_KIND;
+  version: 1;
+  sourceInstanceId: string;
+  name: string | null;
+  metadata: Record<string, unknown>;
+}
+
+type SnapshotVm = VM & { description?: string | null; immutable?: boolean };
+
+function snapshotRecord(description: string | null | undefined): SnapshotRecord | undefined {
+  if (!description) return undefined;
+  let record: SnapshotRecord;
+  try { record = JSON.parse(description); } catch { return undefined; }
+  if (!record || record.kind !== SNAPSHOT_KIND || record.version !== 1 ||
+      typeof record.sourceInstanceId !== 'string' || !record.sourceInstanceId ||
+      !(record.name === null || typeof record.name === 'string') ||
+      !record.metadata || typeof record.metadata !== 'object' || Array.isArray(record.metadata)) return undefined;
+  return record;
+}
+
+function snapshotInfo(vm: VM, record: SnapshotRecord): ArkerSnapshot {
+  return {
+    id: vm.id,
+    provider: 'arker',
+    createdAt: vm.created_at ? new Date(vm.created_at) : new Date(),
+    metadata: { name: record.name ?? vm.name, sourceInstanceId: record.sourceInstanceId, ...record.metadata },
+  };
+}
 
 export interface ArkerSnapshot {
   /** ID of the forked VM; pass it as `snapshotId` to restore. */
@@ -133,6 +152,7 @@ export interface ArkerSnapshot {
 
 /** Id of the schedule rule `pause` writes to suspend a VM. */
 const PAUSE_RULE = 'computesdk-pause';
+const LIFETIME_RULE = 'computesdk-lifetime';
 /** How long `pause` waits for the suspend to take effect. */
 const PAUSE_TIMEOUT_MS = 60_000;
 
@@ -153,84 +173,9 @@ const exposesPort = (rule: PolicyEntry, port: number): boolean =>
 /** Single-quote a string for `sh -c`, escaping any embedded single quotes. */
 const singleQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 
-/** Leads the hold's command, so a restore can find the copy it inherits. */
+/** Marker of a synthetic hold inherited from an older adapter. */
 const KEEP_AWAKE_MARK = ': computesdk-keep-awake';
-const KEEP_AWAKE_COMMAND = `${KEEP_AWAKE_MARK}; while :; do sleep 3600 || exit; done`;
-/** Default keep-awake window when create omits timeout. */
-const DEFAULT_KEEP_AWAKE_MS = 300_000;
-/** How many times a hold that fails to start is tried, one try after each command. */
-const MAX_HOLD_ATTEMPTS = 3;
-/** Sandboxes this process created that await their first command to be held awake, by VM id. */
-const holdsToStart = new Map<string, { createdAt: number; timeoutMs: number; attempts: number }>();
-/** Keep-awake work still under way, by VM id; `pause()` and a new hold wait for it. */
-const keepAwakeSetup = new Map<string, Promise<void>>();
-/** Sandboxes paused from this process, by VM id: a hold waits for their next command or `resume()`. */
-const pausedVms = new Set<string>();
-/** The keep-awake window of each sandbox this process created, in ms (`0`: no limit), for `getInfo`. */
-const keepAwakeMs = new Map<string, number>();
-
-/** Record keep-awake work for a VM, after whatever is already under way for it. */
-function queueKeepAwake(vmId: string, work: () => Promise<void>): void {
-  const setup: Promise<void> = (keepAwakeSetup.get(vmId) ?? Promise.resolve())
-    .then(work)
-    .catch(() => {})
-    .finally(() => {
-      if (keepAwakeSetup.get(vmId) === setup) keepAwakeSetup.delete(vmId);
-    });
-  keepAwakeSetup.set(vmId, setup);
-}
-
-/**
- * Start a sandbox's hold after a command, for what is left of its timeout. A
- * hold that fails to start is tried again after the next command, a few times;
- * one for a VM that is gone, or was destroyed meanwhile, is not.
- */
-function startHold(vm: VM): void {
-  const pending = holdsToStart.get(vm.id);
-  // A paused sandbox stays paused: its next command or `resume()` starts the hold.
-  if (!pending || pausedVms.has(vm.id)) return;
-  holdsToStart.delete(vm.id);
-  const left = pending.timeoutMs && pending.timeoutMs - (Date.now() - pending.createdAt);
-  if (pending.timeoutMs && left <= 0) return;
-  queueKeepAwake(vm.id, () =>
-    holdAwake(vm, left).catch((err) => {
-      if (!isNotFound(err) && keepAwakeMs.has(vm.id) && pending.attempts + 1 < MAX_HOLD_ATTEMPTS) {
-        holdsToStart.set(vm.id, { ...pending, attempts: pending.attempts + 1 });
-      }
-      throw err;
-    }),
-  );
-}
-
-/** Forget holds whose time ran out before their sandbox ran a command here. */
-function pruneHoldsToStart(now: number): void {
-  for (const [id, { createdAt, timeoutMs }] of holdsToStart) {
-    if (timeoutMs && now - createdAt >= timeoutMs) holdsToStart.delete(id);
-  }
-}
-
-/**
- * Keep the VM running between commands. Arker pauses a VM once none of
- * its runs is live, so one run that never finishes holds it awake.
- * A session of its own keeps commands from waiting on the hold. The
- * run dies with the VM, goes `pending` across a pause and carries on at resume,
- * and is killed at `timeoutMs`, after which the VM pauses between commands
- * again.
- */
-async function holdAwake(vm: VM, timeoutMs: number): Promise<void> {
-  const { session_id } = await vm.createSession();
-  try {
-    await vm.run(KEEP_AWAKE_COMMAND, {
-      session_id,
-      time_to_background: 0,
-      idempotencyKey: randomUUID(),
-      ...(timeoutMs ? { timeout: Math.max(1, Math.ceil(timeoutMs / 1000)) } : {}),
-    });
-  } catch (err) {
-    await vm.deleteSession(session_id).catch(() => {});
-    throw err;
-  }
-}
+const DEFAULT_LIFETIME_MS = 300_000;
 
 /**
  * A fork copies its source's live runs, so a sandbox restored from a snapshot
@@ -320,12 +265,7 @@ function releaseSession(vmId: string, sessionId: string | undefined, reusable: b
 }
 
 /** Forget what this process tracks for a VM it destroyed. */
-function forgetVm(vmId: string): void {
-  holdsToStart.delete(vmId);
-  pausedVms.delete(vmId);
-  keepAwakeMs.delete(vmId);
-  commandSessions.delete(vmId);
-}
+function forgetVm(vmId: string): void { commandSessions.delete(vmId); }
 
 /** Reject once `ms` elapses, so a caller's timeout is a real deadline. */
 async function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -354,7 +294,9 @@ const toVolume = (fs: Filesystem): Volume => ({ id: fs.filesystem_id, name: fs.n
 
 async function findFilesystemById(client: Arker, id: string): Promise<Filesystem | null> {
   try {
-    return await client.getFilesystem(id);
+    const filesystem = await client.getFilesystem(id);
+    if (filesystem.filesystem_id !== id) throw new Error('Arker returned a different filesystem id');
+    return filesystem;
   } catch (err) {
     if (isNotFound(err)) return null;
     throw err;
@@ -424,14 +366,20 @@ async function mountFilesystem(vm: VM, filesystemId: string, path: string): Prom
   const { mount_id } = await vm.createMount({ filesystemId, path: same?.path ?? mountPoint(path) });
   const had = before.find((m) => m.mount_id === mount_id);
   const sessionId = await asideSession(vm);
+  const failures: unknown[] = [];
   try {
     await waitUntilMounted(vm, filesystemId, mount_id, path, sessionId, had?.state === 'failed');
   } catch (err) {
-    if (!had || had.state === 'failed') await vm.deleteMount(mount_id).catch(() => {});
-    throw err;
-  } finally {
-    if (sessionId) vm.deleteSession(sessionId).catch(() => {});
+    failures.push(err);
+    if (!had || had.state === 'failed') {
+      try { await vm.deleteMount(mount_id); } catch (cleanup) { failures.push(cleanup); }
+    }
   }
+  if (sessionId) {
+    try { await vm.deleteSession(sessionId); } catch (cleanup) { failures.push(cleanup); }
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw Object.assign(new Error('Arker mount and cleanup failed'), { errors: failures });
 }
 
 /** Every mount on a VM, across pages. */
@@ -459,7 +407,7 @@ async function waitUntilMounted(
       ...(sessionId ? { session_id: sessionId } : {}),
     });
     const { mounts } = await vm.listMounts({ filesystemId });
-    const mount = mounts.find((m) => m.mount_id === mountId);
+    const mount = mounts.find((m) => m.mount_id === mountId && m.filesystem_id === filesystemId);
     if (mount?.state === 'mounted') return;
     if (!mount) throw new Error(`Arker mount ${mountId} of ${filesystemId} on VM ${vm.id} disappeared`);
     // A failed mount being tried again keeps its old `failed` record until
@@ -530,8 +478,8 @@ export const arker = defineProvider<VM, ArkerConfig>({
     if (options?.snapshotId) {
       return { status: 'unknown', reason: 'A snapshot fork keeps its source VM\'s resource bounds, which this adapter has not verified.' };
     }
-    if (options?.image) {
-      return { status: 'unknown', reason: 'An OCI image fork does not use a golden source VM, so its resource bounds are not the golden bounds this adapter verifies.' };
+    if (options?.image !== undefined) {
+      return { status: 'unknown', reason: 'OCI image resource bounds have not been verified; use native resources instead of sizeClass.' };
     }
     const pinned = options?.templateId || config.source || env('ARKER_SOURCE');
     if (pinned) {
@@ -552,6 +500,13 @@ export const arker = defineProvider<VM, ArkerConfig>({
       // --- Collection operations ---
 
       create: async (config: ArkerConfig, options?: CreateInstanceOptions) => {
+        const image = options?.image;
+        if (image !== undefined && (typeof image !== 'string' || !image.trim())) {
+          throw new Error('Arker image must be a nonempty OCI image reference');
+        }
+        if (image !== undefined && (options?.snapshotId || options?.templateId)) {
+          throw new Error('Arker image cannot be combined with snapshotId or templateId');
+        }
         const client = makeClient(config);
         const name = options?.name ?? null;
         
@@ -560,6 +515,19 @@ export const arker = defineProvider<VM, ArkerConfig>({
           env('ARKER_PLATFORMS')?.split(',').map((p) => p.trim()).filter(Boolean);
         const resources = options?.resources as ResourcesInput | undefined;
         const source = options?.templateId || config.source || env('ARKER_SOURCE') || DEFAULT_SOURCE;
+        const timeout = options?.timeout ?? DEFAULT_LIFETIME_MS;
+        if (!Number.isFinite(timeout) || timeout < 0 || timeout > 2_592_000_000) {
+          throw new Error('Arker instance timeout must be between 0 and 2592000000 milliseconds (30 days)');
+        }
+        const policies = {
+          rules: {
+            [RUNTIME_RULE]: config.keepAwake === false ? null : { type: 'runtime', action: 'keep_running' },
+            [LIFETIME_RULE]: timeout === 0 ? null : {
+              type: 'schedule' as const, after_created: Math.ceil(timeout / 1000), action: 'delete' as const,
+            },
+          },
+        } as unknown as Parameters<Arker['fork']>[0]['policies'];
+        const forkOptions = { name, ...(resources ? { resources } : {}), policies };
 
         // Arker has no native `volumes` shape to pass through, so anything but
         // unified `{ volume, mountPath }` entries is a mistake worth reporting.
@@ -580,14 +548,14 @@ export const arker = defineProvider<VM, ArkerConfig>({
           // SDK 1.x takes a single options object keyed by the wire schema
           // (`source_vm_id` / `source_vm_name` / `image`); the old
           // `fork(name, opts)` overload is gone.
-          const placed = { name, ...(platforms?.length ? { platforms } : {}), ...(resources ? { resources } : {}) };
+          const placed = { ...forkOptions, ...(platforms?.length ? { platforms } : {}) };
           // An OCI `image` boots a rootfs Arker converts from that image. A
           // first conversion can outlast a gateway timeout; with a key, the
           // SDK's retry gets back the VM it built instead of leaving it behind.
           vm = options?.snapshotId
-            ? await client.fork({ source_vm_id: options.snapshotId, name, ...(resources ? { resources } : {}) })
-            : options?.image
-              ? await client.fork({ image: options.image, ...placed, idempotency: true })
+            ? await client.fork({ source_vm_id: options.snapshotId, ...forkOptions })
+            : image !== undefined
+              ? await client.fork({ image, ...placed, idempotency: true })
               : await client.fork({ source_vm_name: source, ...placed });
         } catch (err) {
           // The source VM bounds the resources a fork can take; Arker enforces them.
@@ -601,31 +569,19 @@ export const arker = defineProvider<VM, ArkerConfig>({
           throw err;
         }
 
-        if (mounts.length > 0) {
+        try {
+          if (image === undefined) await endInheritedHold(vm);
+          for (const { id, mountPath } of mounts) await mountFilesystem(vm, id, mountPath);
+        } catch (error) {
           try {
-            for (const { id, mountPath } of mounts) await mountFilesystem(vm, id, mountPath);
-          } catch (err) {
-            // The caller never gets this VM, so it must not outlive the failure.
-            await vm.delete().catch(() => {});
-            throw err;
+            await vm.delete();
+          } catch (cleanupError) {
+            throw Object.assign(new Error(`Arker create failed and VM ${vm.id} cleanup failed`), {
+              cause: error, cleanupError,
+            });
           }
+          throw error;
         }
-
-        // Both run in the background: a fork of a VM that may carry a hold
-        // (a snapshot, or a VM of yours named as the source) ends the one it
-        // inherited at once, and a new hold starts after the first command
-        // (`startHold`). Images and public goldens carry no runs.
-        const mayInherit = options?.snapshotId || (!options?.image && !PUBLIC_GOLDENS.has(source));
-        if (mayInherit) queueKeepAwake(vm.id, () => endInheritedHold(vm));
-        if (config.keepAwake ?? true) {
-          const now = Date.now();
-          pruneHoldsToStart(now);
-          const requestedMs = options?.timeout;
-          const timeoutMs = typeof requestedMs === 'number' && Number.isFinite(requestedMs) && requestedMs >= 0 ? requestedMs : DEFAULT_KEEP_AWAKE_MS;
-          holdsToStart.set(vm.id, { createdAt: now, timeoutMs, attempts: 0 });
-          keepAwakeMs.set(vm.id, timeoutMs);
-        }
-
         return { instance: vm, instanceId: vm.id };
       },
 
@@ -642,21 +598,22 @@ export const arker = defineProvider<VM, ArkerConfig>({
 
       list: async (config: ArkerConfig) => {
         const client = makeClient(config);
-        const { vms } = await client.listVms();
-        return vms.map((vm) => ({ instance: vm, instanceId: vm.id }));
+        const instances = [];
+        let cursor: string | undefined;
+        do {
+          const page = await client.listVms(cursor ? { cursor } : {});
+          instances.push(...page.vms.map((vm) => ({ instance: vm, instanceId: vm.id })));
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor);
+        return instances;
       },
 
       destroy: async (config: ArkerConfig, sandboxId: string) => {
-        // No hold may start while the delete is under way; one still to start
-        // is kept if the delete fails and the sandbox lives on.
-        const pending = holdsToStart.get(sandboxId);
-        holdsToStart.delete(sandboxId);
         const client = makeClient(config);
         try {
           await client.vm(sandboxId).delete();
         } catch (err) {
           if (!(err instanceof ArkerError && err.status === 404)) {
-            if (pending && keepAwakeMs.has(sandboxId)) holdsToStart.set(sandboxId, pending);
             throw err;
           }
         }
@@ -697,8 +654,6 @@ export const arker = defineProvider<VM, ArkerConfig>({
         // sub-second timeout stays non-zero — 0 means "no limit" to Arker).
         if (options?.timeout) runOptions.timeout = Math.max(1, Math.ceil(options.timeout / 1000));
 
-        // A command starts a paused VM, so the sandbox is no longer paused.
-        pausedVms.delete(sandbox.id);
         const session = await takeSession(sandbox);
         if (session) {
           runOptions.session_id = session;
@@ -726,7 +681,6 @@ export const arker = defineProvider<VM, ArkerConfig>({
           // failed is set aside.
           if (result !== undefined || session === undefined) releaseSession(sandbox.id, session, true);
           else run.then(() => releaseSession(sandbox.id, session, true), () => releaseSession(sandbox.id, session, false));
-          startHold(sandbox);
         }
         return {
           stdout: result.stdout,
@@ -741,9 +695,10 @@ export const arker = defineProvider<VM, ArkerConfig>({
         provider: 'arker',
         status: 'running',
         createdAt: sandbox.created_at ? new Date(sandbox.created_at) : new Date(),
-        // How long the sandbox is kept awake (see `keepAwake`); `0` when it
-        // isn't, has no limit, or was created in another process.
-        timeout: keepAwakeMs.get(sandbox.id) ?? 0,
+        timeout: (() => {
+          const lifetime = sandbox.policies?.rules?.[LIFETIME_RULE];
+          return lifetime?.type === 'schedule' ? (lifetime.after_created ?? 0) * 1000 : 0;
+        })(),
       }),
 
       // Arker serves a guest port once an inbound policy rule allows it, at
@@ -754,10 +709,22 @@ export const arker = defineProvider<VM, ArkerConfig>({
         const { port } = options;
         const current = await sandbox.getPolicies();
         const rules = current.policies ?? [];
-        let doc: PolicyDoc = current;
+        let doc = current;
         if (!rules.some((rule) => exposesPort(rule, port))) {
-          const rule: PolicyEntry = { type: 'inbound', match: { ports: [port] }, action: 'allow', auth: 'open' };
-          doc = await sandbox.setPolicies({ policies: [...rules, rule], ...(current.secrets ? { secrets: current.secrets } : {}) });
+          // The legacy list contains network rules only. Replacing it would
+          // silently remove runtime and lifetime rules, so patch one named
+          // rule instead. Append below existing rules so a public allow cannot
+          // bypass a customer's higher-precedence deny or authentication rule.
+          const vm = await sandbox.refresh();
+          const priorities = Object.values(vm.policies?.rules ?? {})
+            .filter((rule) => rule.type === 'inbound')
+            .map((rule) => 'priority' in rule ? rule.priority : 0);
+          const priority = priorities.length === 0 ? 1_000_000 : Math.min(...priorities) - 1;
+          if (priority < 0) throw new Error('Arker cannot add a port below existing inbound rules: priority zero is already occupied');
+          await patchRule(sandbox, `computesdk-port-${port}`, {
+            type: 'inbound', priority, match: { ports: [port] }, action: 'allow', auth: 'open',
+          });
+          doc = await sandbox.getPolicies();
         }
         const base = doc.hostname ?? current.hostname;
         if (!base) throw new Error(`Arker did not return an inbound hostname for VM ${sandbox.id}`);
@@ -781,10 +748,10 @@ export const arker = defineProvider<VM, ArkerConfig>({
       detachVolume: async (sandbox: VM, volume: string | Volume, mountPath?: string): Promise<void> => {
         // A saved handle can still identify a mount after its filesystem is deleted.
         const id = await filesystemId(sandbox._client, volume, { allowDeleted: true });
-        const { mounts } = await sandbox.listMounts({ filesystemId: id });
-        const mount = mounts.find((m) => mountPath === undefined || samePath(m.path, mountPath));
-        if (!mount) throw new Error(`Arker volume ${id} has no such mount on VM ${sandbox.id}`);
-        await sandbox.deleteMount(mount.mount_id);
+        const mounts = (await allMounts(sandbox)).filter((m) =>
+          m.filesystem_id === id && (mountPath === undefined || samePath(m.path, mountPath)));
+        if (mounts.length === 0) throw new Error(`Arker volume ${id} has no such mount on VM ${sandbox.id}`);
+        for (const mount of mounts) await sandbox.deleteMount(mount.mount_id);
       },
 
       // An idle Arker VM is already frozen; pause suspends a running one too
@@ -793,29 +760,19 @@ export const arker = defineProvider<VM, ArkerConfig>({
       // it can't outlive the pause. Memory is kept: processes and in-flight
       // runs carry on when the VM next starts.
       pause: async (sandbox: VM): Promise<void> => {
-        // A hold that starts after the suspend would wake the VM again: wait
-        // for one under way, and keep a later one back until the sandbox
-        // runs a command or resumes.
-        pausedVms.add(sandbox.id);
+        await patchRule(sandbox, PAUSE_RULE, {
+          type: 'schedule',
+          at: new Date(Date.now() - 1000).toISOString(),
+          action: 'suspend',
+        });
         try {
-          await keepAwakeSetup.get(sandbox.id);
-          await patchRule(sandbox, PAUSE_RULE, {
-            type: 'schedule',
-            at: new Date(Date.now() - 1000).toISOString(),
-            action: 'suspend',
-          });
-          try {
-            const deadline = Date.now() + PAUSE_TIMEOUT_MS;
-            while ((await sandbox.refresh()).state !== 'idle') {
-              if (Date.now() > deadline) throw new Error(`Arker VM ${sandbox.id} did not suspend within ${PAUSE_TIMEOUT_MS}ms`);
-              await new Promise((resolve) => setTimeout(resolve, 500));
-            }
-          } finally {
-            await patchRule(sandbox, PAUSE_RULE, null);
+          const deadline = Date.now() + PAUSE_TIMEOUT_MS;
+          while ((await sandbox.refresh()).state !== 'idle') {
+            if (Date.now() > deadline) throw new Error(`Arker VM ${sandbox.id} did not suspend within ${PAUSE_TIMEOUT_MS}ms`);
+            await new Promise((resolve) => setTimeout(resolve, 500));
           }
-        } catch (err) {
-          pausedVms.delete(sandbox.id);
-          throw err;
+        } finally {
+          await patchRule(sandbox, PAUSE_RULE, null);
         }
       },
 
@@ -823,7 +780,6 @@ export const arker = defineProvider<VM, ArkerConfig>({
       // The run takes a free session, so it does not wait on a command the
       // pause interrupted.
       resume: async (sandbox: VM): Promise<void> => {
-        pausedVms.delete(sandbox.id);
         const session = await takeSession(sandbox);
         let returned = false;
         try {
@@ -833,7 +789,6 @@ export const arker = defineProvider<VM, ArkerConfig>({
         } finally {
           releaseSession(sandbox.id, session, returned);
         }
-        startHold(sandbox);
       },
       pauseCapabilities: { memory: true },
 
@@ -975,20 +930,62 @@ export const arker = defineProvider<VM, ArkerConfig>({
 
       create: async (config: ArkerConfig, instanceId: string, options?: CreateSnapshotOptions): Promise<ArkerSnapshot> => {
         const client = makeClient(config);
-        const name = `${SNAPSHOT_PREFIX}${options?.name ? `${options.name}-` : ''}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-        const vm = await client.vm(instanceId).fork({ name, description: `snapshot of ${instanceId}` });
-        return {
-          id: vm.id,
-          provider: 'arker',
-          createdAt: vm.created_at ? new Date(vm.created_at) : new Date(),
-          metadata: { name: vm.name ?? name, sourceInstanceId: instanceId, ...options?.metadata },
+        const source = await client.getVm(instanceId);
+        if (!source.vm_id) throw new Error('Arker did not return the canonical source VM ID');
+        const record: SnapshotRecord = {
+          kind: SNAPSHOT_KIND, version: 1, sourceInstanceId: source.vm_id,
+          name: options?.name ?? null, metadata: { ...options?.metadata },
         };
+        const description = JSON.stringify(record, (_key, value) => {
+          if (value === undefined || typeof value === 'function' || typeof value === 'symbol' ||
+              (typeof value === 'number' && !Number.isFinite(value))) {
+            throw new Error('Arker snapshot metadata must be JSON serializable');
+          }
+          return value;
+        });
+        if (Array.from(description).length > 1024) throw new Error('Arker snapshot metadata exceeds 1024 characters');
+        const persisted = snapshotRecord(description);
+        if (!persisted) throw new Error('Arker snapshot metadata must serialize to a JSON object');
+        const vm = await new VM(client, source.vm_id, source.baseUrl).fork({
+          name: `${SNAPSHOT_PREFIX}${randomUUID()}`, description,
+          policies: { rules: { [LIFETIME_RULE]: null, [RUNTIME_RULE]: null } },
+        });
+        try {
+          // SDK 1.3 drops immutable from update(); send the canonical patch.
+          const frozen = await vm._client._request<{ immutable?: boolean }>(
+            'PATCH', `/v1/vms/${encodeURIComponent(vm.id)}`, { immutable: true }, vm.baseUrl,
+          );
+          if (frozen.immutable !== true) throw new Error('Arker did not freeze the snapshot');
+        } catch (error) {
+          try { await vm.delete(); } catch (cleanup) {
+            throw Object.assign(new Error('Snapshot freeze and cleanup failed'), { errors: [error, cleanup] });
+          }
+          throw error;
+        }
+        return snapshotInfo(vm, persisted);
       },
 
-      // Arker's VM listing omits names and caps its pages, so snapshot forks
-      // can't be told apart from other VMs; keep the ids create() returns.
-      list: async (_config: ArkerConfig, _options?: ListSnapshotsOptions): Promise<ArkerSnapshot[]> => {
-        throw new Error('Arker cannot list snapshots: its VM listing does not identify snapshot forks');
+      list: async (config: ArkerConfig, options?: ListSnapshotsOptions): Promise<ArkerSnapshot[]> => {
+        const client = makeClient(config);
+        const snapshots: ArkerSnapshot[] = [];
+        const sourceId = options?.instanceId ?? options?.sandboxId;
+        let cursor: string | undefined;
+        do {
+          const page = await client.listVms(cursor ? { cursor } : {});
+          for (const listed of page.vms) {
+            let vm = listed as SnapshotVm;
+            let record = snapshotRecord(vm.description);
+            if (!record || (sourceId !== undefined && record.sourceInstanceId !== sourceId)) continue;
+            if (vm.immutable === undefined) {
+              vm = await vm.refresh() as SnapshotVm;
+              record = snapshotRecord(vm.description);
+            }
+            if (!record || vm.immutable !== true || (sourceId !== undefined && record.sourceInstanceId !== sourceId)) continue;
+            snapshots.push(snapshotInfo(vm, record));
+          }
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor);
+        return options?.limit === undefined ? snapshots : snapshots.slice(0, options.limit);
       },
 
       delete: async (config: ArkerConfig, snapshotId: string): Promise<void> => {

@@ -3,174 +3,116 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { arker } from '../index';
 
 const HOLD = ': computesdk-keep-awake; while :; do sleep 3600 || exit; done';
-
 type MockRun = { run_id: string; command: string; state: string };
-
 let nextId = 0;
 
-function mockVm(opts: { session?: () => Promise<unknown>; hold?: () => Promise<unknown>; runs?: MockRun[]; cancel?: () => Promise<unknown> } = {}) {
+function mockVm(runs: MockRun[] = []) {
   const vm = {
     id: `vm-${++nextId}`,
-    createSession: vi.fn(opts.session ?? (async () => ({ session_id: 'sess-awake' }))),
-    run: vi.fn(async (command: string, _options?: unknown) => {
-      if (command !== HOLD) return { stdout: 'ok\n', stderr: '', exitCode: 0 };
-      return opts.hold ? opts.hold() : { type: 'background', runId: 'run-awake' };
-    }),
-    listRuns: vi.fn(async (options?: { state?: string }) => ({ runs: (opts.runs ?? []).filter((r) => r.state === options?.state) })),
-    cancelRun: vi.fn(async (_runId: string) => (opts.cancel ? opts.cancel() : { ok: true })),
-    deleteSession: vi.fn(async (_sessionId: string) => ({ deleted: true })),
-    update: vi.fn(async (_body: unknown) => ({})),
+    policies: undefined as unknown,
+    createSession: vi.fn(async () => ({ session_id: 'session' })),
+    run: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    listRuns: vi.fn(async (options?: { state?: string; cursor?: string }) => ({
+      runs: runs.filter((run) => run.state === options?.state), next_cursor: null as string | null,
+    })),
+    cancelRun: vi.fn(async (_id: string) => ({ ok: true })),
+    delete: vi.fn(async () => ({ deleted: true })),
+    update: vi.fn(async () => ({})),
     refresh: vi.fn(async () => ({ state: 'idle' })),
   };
-  const fork = vi.spyOn(Arker.prototype, 'fork').mockResolvedValue(vm as unknown as VM);
+  const fork = vi.spyOn(Arker.prototype, 'fork').mockImplementation(async (options) => {
+    vm.policies = options.policies;
+    return vm as unknown as VM;
+  });
   return { vm, fork };
 }
 
-const holdCalls = (vm: ReturnType<typeof mockVm>['vm']) => vm.run.mock.calls.filter(([command]) => command === HOLD);
-
-describe('Arker keep-awake (mock)', () => {
+describe('Arker native keep-awake and legacy restore compatibility', () => {
   afterEach(() => { vi.restoreAllMocks(); });
 
-  it('holds the sandbox awake after its first command, for 5 minutes, in a session of its own', async () => {
-    const { vm } = mockVm();
-    const sandbox = await arker({ apiKey: 'ark_test' }).instances.create();
-    // Nothing starts at create, so the first command does not wait on it.
+  it('sets native execution and a five-minute delete deadline before any command', async () => {
+    const { vm, fork } = mockVm();
+    const box = await arker({ apiKey: 'ark_test' }).instances.create();
+    expect(fork).toHaveBeenCalledWith(expect.objectContaining({ policies: { rules: {
+      'computesdk-runtime': { type: 'runtime', action: 'keep_running' },
+      'computesdk-lifetime': { type: 'schedule', action: 'delete', after_created: 300 },
+    } } }));
+    expect(vm.run).not.toHaveBeenCalled();
     expect(vm.createSession).not.toHaveBeenCalled();
-    expect((await sandbox.runCommand('nohup worker &')).exitCode).toBe(0);
-    await sandbox.runCommand('echo again');
-    await vi.waitFor(() => expect(holdCalls(vm)).toHaveLength(1));
-    expect(vm.run.mock.calls[0][0]).toBe('nohup worker &');
-    expect(holdCalls(vm)[0][1]).toEqual({ session_id: 'sess-awake', time_to_background: 0, idempotencyKey: expect.any(String), timeout: 300 });
-    expect(vm.createSession).toHaveBeenCalledTimes(1);
-    expect(vm.listRuns).not.toHaveBeenCalled();
+    expect((await box.getInfo()).timeout).toBe(300_000);
+    await box.runCommand('true');
+    expect(vm.run.mock.calls).toHaveLength(1);
+    expect(vm.createSession).not.toHaveBeenCalled();
   });
 
-  it('holds it for what is left of the sandbox timeout, or with no limit at 0', async () => {
-    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
-    const timed = mockVm();
-    const sandbox = await arker({ apiKey: 'ark_test' }).instances.create({ timeout: 90_000 });
-    now.mockReturnValue(1_060_500);
-    await sandbox.runCommand('true');
-    await vi.waitFor(() => expect(holdCalls(timed.vm)).toHaveLength(1));
-    expect(holdCalls(timed.vm)[0][1]).toMatchObject({ timeout: 30 });
-
-    const unlimited = mockVm();
-    await (await arker({ apiKey: 'ark_test' }).instances.create({ timeout: 0 })).runCommand('true');
-    await vi.waitFor(() => expect(holdCalls(unlimited.vm)).toHaveLength(1));
-    expect(holdCalls(unlimited.vm)[0][1]).not.toHaveProperty('timeout');
-
-    const expired = mockVm();
-    const late = await arker({ apiKey: 'ark_test' }).instances.create({ timeout: 1_000 });
-    now.mockReturnValue(1_160_500);
-    await late.runCommand('true');
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(holdCalls(expired.vm)).toHaveLength(0);
+  it('removes an inherited adapter runtime rule when keepAwake is false without losing the lifetime', async () => {
+    const { fork } = mockVm();
+    await arker({ apiKey: 'ark_test', keepAwake: false }).instances.create({ snapshotId: 'snapshot', timeout: 90_000 });
+    expect(fork).toHaveBeenCalledWith(expect.objectContaining({ policies: { rules: {
+      'computesdk-runtime': null,
+      'computesdk-lifetime': { type: 'schedule', action: 'delete', after_created: 90 },
+    } } }));
   });
 
-  it('ends the hold a restore inherits at once, then holds it after its first command', async () => {
-    const runs = [
-      { run_id: 'copied-hold', command: HOLD, state: 'pending' },
-      { run_id: 'older-hold', command: ': computesdk-keep-awake; sleep infinity', state: 'running' },
-      { run_id: 'old-hold', command: HOLD, state: 'completed' },
-      { run_id: 'their-run', command: 'sleep 60', state: 'pending' },
-    ];
-    const { vm, fork } = mockVm({ runs });
-    const sandbox = await arker({ apiKey: 'ark_test' }).instances.create({ snapshotId: 'vm-snap' });
-    expect(fork.mock.calls[0][0]).toMatchObject({ source_vm_id: 'vm-snap' });
-    await vi.waitFor(() => expect(vm.cancelRun).toHaveBeenCalledTimes(2));
-    expect(vm.listRuns.mock.calls).toEqual([[{ state: 'pending' }], [{ state: 'running' }]]);
-    expect(vm.cancelRun.mock.calls).toEqual([['copied-hold'], ['older-hold']]);
-    expect(holdCalls(vm)).toHaveLength(0);
-    await sandbox.runCommand('true');
-    await vi.waitFor(() => expect(holdCalls(vm)).toHaveLength(1));
+  it('reports persisted unlimited lifetime without creator-process bookkeeping', async () => {
+    const { vm } = mockVm();
+    const box = await arker({ apiKey: 'ark_test' }).instances.create({ timeout: 0 });
+    expect((await box.getInfo()).timeout).toBe(0);
+    expect(vm.run).not.toHaveBeenCalled();
   });
 
-  it('waits for the inherited hold to end before starting its own, which uses the same command', async () => {
-    let listed!: (value: { runs: MockRun[] }) => void;
-    const { vm } = mockVm({ runs: [{ run_id: 'copied-hold', command: HOLD, state: 'pending' }] });
-    vm.listRuns.mockImplementationOnce(() => new Promise((resolve) => { listed = resolve; }));
-    const sandbox = await arker({ apiKey: 'ark_test' }).instances.create({ snapshotId: 'vm-snap' });
-    await sandbox.runCommand('true');
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(holdCalls(vm)).toHaveLength(0);
-    listed({ runs: [{ run_id: 'copied-hold', command: HOLD, state: 'pending' }] });
-    await vi.waitFor(() => expect(holdCalls(vm)).toHaveLength(1));
-    expect(vm.cancelRun.mock.invocationCallOrder[0]).toBeLessThan(vm.createSession.mock.invocationCallOrder[0]);
+  it('cancels only legacy marked pending/running holds before returning a restore', async () => {
+    const { vm } = mockVm([
+      { run_id: 'pending-hold', command: HOLD, state: 'pending' },
+      { run_id: 'running-hold', command: HOLD, state: 'running' },
+      { run_id: 'finished-hold', command: HOLD, state: 'completed' },
+      { run_id: 'customer', command: 'sleep 3600', state: 'running' },
+    ]);
+    await arker({ apiKey: 'ark_test', keepAwake: false }).instances.create({ snapshotId: 'snapshot' });
+    expect(vm.cancelRun.mock.calls).toEqual([['pending-hold'], ['running-hold']]);
+    expect(vm.run).not.toHaveBeenCalled();
   });
 
-  it('tries a cancel again while Arker is briefly unavailable', async () => {
-    let refusals = 1;
-    const { vm } = mockVm({
-      runs: [{ run_id: 'copied-hold', command: HOLD, state: 'pending' }],
-      cancel: async () => {
-        if (refusals-- > 0) throw new ArkerError('unavailable', 'try again', 503);
-        return { ok: true };
-      },
-    });
-    await arker({ apiKey: 'ark_test' }).instances.create({ snapshotId: 'vm-snap' });
-    await vi.waitFor(() => expect(vm.cancelRun).toHaveBeenCalledTimes(2), { timeout: 5_000 });
+  it('cancels legacy holds on every run page', async () => {
+    const { vm } = mockVm();
+    vm.listRuns
+      .mockResolvedValueOnce({ runs: [], next_cursor: 'next' })
+      .mockResolvedValueOnce({ runs: [{ run_id: 'late', command: HOLD, state: 'pending' }], next_cursor: null });
+    await arker({ apiKey: 'ark_test' }).instances.create({ snapshotId: 'snapshot' });
+    expect(vm.listRuns).toHaveBeenNthCalledWith(2, { state: 'pending', cursor: 'next' });
+    expect(vm.cancelRun).toHaveBeenCalledWith('late');
   });
 
-  it('ends a hold inherited from a VM of yours forked by name, but looks for none in a public golden or an image', async () => {
-    const { vm, fork } = mockVm({ runs: [{ run_id: 'copied-hold', command: HOLD, state: 'running' }] });
-    await arker({ apiKey: 'ark_test' }).instances.create({ templateId: 'my-base' });
-    expect(fork.mock.calls[0][0]).toMatchObject({ source_vm_name: 'my-base' });
-    await vi.waitFor(() => expect(vm.cancelRun).toHaveBeenCalledWith('copied-hold'));
+  it('cleans up a failed restore and exposes both cancellation and cleanup failures', async () => {
+    const { vm } = mockVm([{ run_id: 'hold', command: HOLD, state: 'running' }]);
+    const cancel = new ArkerError('forbidden', 'cannot cancel', 403);
+    const cleanup = new Error('delete failed');
+    vm.cancelRun.mockRejectedValue(cancel);
+    vm.delete.mockRejectedValue(cleanup);
+    await expect(arker({ apiKey: 'ark_test' }).instances.create({ snapshotId: 'snapshot' }))
+      .rejects.toMatchObject({ cause: cancel, cleanupError: cleanup });
+  });
+
+  it('retries a transient legacy cancellation but never creates another synthetic hold', async () => {
+    const { vm } = mockVm([{ run_id: 'hold', command: HOLD, state: 'running' }]);
+    vm.cancelRun.mockRejectedValueOnce(new ArkerError('unavailable', 'retry', 503));
+    await arker({ apiKey: 'ark_test' }).instances.create({ snapshotId: 'snapshot' });
+    expect(vm.cancelRun).toHaveBeenCalledTimes(2);
+    expect(vm.createSession).not.toHaveBeenCalled();
+    expect(vm.run).not.toHaveBeenCalled();
+  });
+
+  it('scans every VM source, including a customer VM shadowing a golden name, but not OCI images', async () => {
+    const { vm } = mockVm();
+    await arker({ apiKey: 'ark_test' }).instances.create({ templateId: 'my-source' });
+    expect(vm.listRuns).toHaveBeenCalledTimes(2);
     vm.listRuns.mockClear();
-    await arker({ apiKey: 'ark_test' }).instances.create();
-    await arker({ apiKey: 'ark_test' }).instances.create({ templateId: 'ubuntu-coding' });
+    vm.listRuns.mockResolvedValueOnce({ runs: [{ run_id: 'shadowed-hold', command: HOLD, state: 'pending' }], next_cursor: null });
+    await arker({ apiKey: 'ark_test', keepAwake: false }).instances.create({ templateId: 'ubuntu-small', timeout: 0 });
+    expect(vm.cancelRun).toHaveBeenCalledWith('shadowed-hold');
+    expect(vm.listRuns).toHaveBeenCalledTimes(2);
+    vm.listRuns.mockClear();
     await arker({ apiKey: 'ark_test' }).instances.create({ image: 'ubuntu:24.04' });
-    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(vm.listRuns).not.toHaveBeenCalled();
-  });
-
-  it('reports the keep-awake window as the sandbox timeout', async () => {
-    mockVm();
-    expect((await (await arker({ apiKey: 'ark_test' }).instances.create()).getInfo()).timeout).toBe(300_000);
-    mockVm();
-    expect((await (await arker({ apiKey: 'ark_test' }).instances.create({ timeout: 90_000 })).getInfo()).timeout).toBe(90_000);
-    mockVm();
-    expect((await (await arker({ apiKey: 'ark_test', keepAwake: false }).instances.create({ timeout: 90_000 })).getInfo()).timeout).toBe(0);
-  });
-
-  it('deletes the session of a hold that failed to start, and gives up after three tries', async () => {
-    const { vm } = mockVm({ hold: async () => { throw new ArkerError('unavailable', 'no capacity', 503); } });
-    const sandbox = await arker({ apiKey: 'ark_test' }).instances.create({ timeout: 0 });
-    for (let i = 0; i < 5; i++) {
-      await sandbox.runCommand('true');
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    expect(holdCalls(vm)).toHaveLength(3);
-    expect(vm.deleteSession).toHaveBeenCalledTimes(3);
-  });
-
-  it('starts no hold while paused, even when a first command ends after the pause', async () => {
-    const { vm } = mockVm();
-    let finish!: () => void;
-    vm.run.mockImplementationOnce(() => new Promise((resolve) => { finish = () => resolve({ stdout: '', stderr: '', exitCode: 0 }); }));
-    const sandbox = await arker({ apiKey: 'ark_test' }).instances.create();
-    const first = sandbox.runCommand('make');
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    await sandbox.pause!();
-    finish();
-    await first;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(vm.createSession).not.toHaveBeenCalled();
-    await sandbox.resume!();
-    await vi.waitFor(() => expect(holdCalls(vm)).toHaveLength(1));
-  });
-
-  it('pauses only once the hold has started, so it cannot wake the VM again', async () => {
-    let started!: (value: unknown) => void;
-    const { vm } = mockVm({ session: () => new Promise((resolve) => { started = resolve; }) });
-    const sandbox = await arker({ apiKey: 'ark_test' }).instances.create();
-    await sandbox.runCommand('true');
-    const paused = sandbox.pause!();
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(vm.update).not.toHaveBeenCalled();
-    started({ session_id: 'sess-awake' });
-    await paused;
-    expect(holdCalls(vm)).toHaveLength(1);
-    expect(vm.update.mock.invocationCallOrder[0]).toBeGreaterThan(vm.run.mock.invocationCallOrder.at(-1)!);
   });
 });

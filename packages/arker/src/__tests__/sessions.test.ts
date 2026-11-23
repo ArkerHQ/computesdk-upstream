@@ -12,6 +12,7 @@ function mockVm(opts: { createSession?: () => Promise<{ session_id: string }> } 
   const running: { command: string; session?: string; finish: () => void; fail: (err: Error) => void }[] = [];
   const vm = {
     id: `vm-sessions-${++nextId}`,
+    listRuns: vi.fn(async () => ({ runs: [] })),
     createSession: vi.fn(opts.createSession ?? (async () => ({ session_id: `sess-${++sessions}` }))),
     run: vi.fn((command: string, options?: { session_id?: string }) =>
       new Promise((resolve, reject) => {

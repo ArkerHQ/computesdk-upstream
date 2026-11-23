@@ -19,6 +19,7 @@ function mockVm(opts: { pollsUntilMounted?: number; fail?: boolean } = {}) {
   const polls = new Map<string, number>();
   const vm = {
     id: 'vm-new',
+    listRuns: vi.fn(async () => ({ runs: [] })),
     _client: Arker.prototype,
     run: vi.fn(async (_command: string, _options?: unknown) => ({ stdout: '', stderr: '', exitCode: 0 })),
     createSession: vi.fn(async () => ({ session_id: 'sess-wait' })),
@@ -60,7 +61,9 @@ describe('Arker OCI image (mock)', () => {
   it('forks from the image, keeping placement and resources', async () => {
     const { fork } = mockVm();
     await arker({ ...config, platforms: ['graviton4'] }).instances.create({ image: 'ubuntu:24.04', name: 'oci', resources: { vcpu: 2 } });
-    expect(fork).toHaveBeenCalledWith({ image: 'ubuntu:24.04', name: 'oci', platforms: ['graviton4'], resources: { vcpu: 2 }, idempotency: true });
+    expect(fork).toHaveBeenCalledWith({ image: 'ubuntu:24.04', name: 'oci', platforms: ['graviton4'], resources: { vcpu: 2 }, idempotency: true,
+      policies: { rules: { 'computesdk-runtime': null, 'computesdk-lifetime': { type: 'schedule', after_created: 300, action: 'delete' } } },
+    });
   });
 
   it('does not size an image fork against golden bounds', () => {

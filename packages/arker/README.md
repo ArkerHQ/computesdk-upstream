@@ -50,11 +50,13 @@ const sandbox = await sdk.instances.create();
 
 ## How sandboxes are created
 
-Arker disables direct VM creation — every sandbox is **forked**, from a source VM or an OCI image. `create()` forks the `ubuntu-small` golden (Node.js + Python preinstalled) by default. The source can be chosen three ways:
+Sandboxes opt into Arker's `runtime: keep_running` policy so background processes continue between commands. Compute stays allocated and billed until an explicit pause, destruction, instance deadline, or host/resource-pressure suspension. This requires an Arker server supporting runtime policy rules; deploy that server support before releasing this adapter update. Snapshot records remove the adapter's keep-running and lifetime rules, and restored instances receive their own execution policy.
+
+`create()` forks the `ubuntu-small` golden (Node.js + Python preinstalled) by default. Choose an existing VM or boot a root filesystem from an OCI image:
 
 - **By name** — a golden/template, via `source` in config or `templateId` in create options.
 - **By id** — a specific existing VM, via `snapshotId` in create options. The `instanceId` returned by `create()` is itself a valid source, so this branches a sandbox from its current state (Arker's equivalent of a snapshot restore). If both are given, `snapshotId` wins.
-- **From an OCI image** — `image` in create options, e.g. `ubuntu:24.04` or `ghcr.io/org/app:v1`, from a public registry. Arker converts the image's rootfs and boots it; the first create of an image pays for the conversion, and later creates of it are usually faster. `snapshotId` wins over `image`, and `image` over a golden.
+- **By image** — `image: 'ubuntu:24.04'` boots an OCI image through Arker's native image fork. Images cannot be combined with `templateId` or `snapshotId`. Use native `resources` for image sizing; standard `sizeClass` bounds have not been verified for arbitrary images.
 
 ```typescript
 // Default: forks the `ubuntu-small` golden
@@ -100,6 +102,12 @@ await volumes.delete('datasets');
 
 ## Configuration
 
+`create({ timeout })` sets the instance lifetime in milliseconds using an Arker
+scheduled-delete policy, including when restoring a snapshot. Positive lifetimes
+are rounded up to whole seconds, up to 30 days; `0` removes an inherited adapter
+deadline. Omitting `timeout` sets a five-minute lifetime. Snapshot handles
+themselves do not inherit the adapter's source-instance deadline.
+
 ### Environment Variables
 
 ```bash
@@ -119,8 +127,8 @@ interface ArkerConfig {
   /** Golden source VM to fork on create(). Falls back to ARKER_SOURCE, then `ubuntu-small`. */
   source?: string;
   /**
-   * Keep each sandbox running between commands for its `timeout` (5 minutes
-   * when unset; `0` for no limit) or until it is destroyed. Default `true`.
+   * Keep each sandbox running between commands with a server policy.
+   * Default true; explicit pause and host/resource-pressure suspension apply.
    * With `false`, Arker pauses the VM whenever no command is running, which
    * also freezes background processes, and bills only while commands run.
    */
@@ -129,16 +137,16 @@ interface ArkerConfig {
 ```
 
 A background process (`nohup ... &`, `startProcess`) keeps running between
-commands while the sandbox is kept awake: from the sandbox's first command, one
-long-lived run in a session of its own holds the VM, billed as compute time,
-until its `timeout` has passed since create (5 minutes by default, no limit at
-`timeout: 0`). When the window ends the sandbox is not deleted: it pauses
-between commands again. The hold starts in the process that created the
-sandbox; a sandbox commanded only from another process (through `getById`) is
-not held. `getInfo().timeout` reports the window. A fork copies a held
-sandbox's runs, hold included: sandboxes this adapter creates from it end the
-copy, but a fork made another way (the Arker SDK or CLI) keeps it running from
-its first use for up to what was left of the source's window.
+commands under the native `keep_running` rule, even after the creating client
+exits. There is no synthetic hold command. `keepAwake: false` removes the
+adapter's inherited runtime rule; unrelated customer rules remain intact.
+The independent instance deadline deletes the VM (five minutes by default,
+unlimited at `timeout: 0`); it does not merely stop a hold and pause compute.
+This corrects the earlier adapter's creator-process-only hold behavior and
+requires the server's runtime-policy support before releasing this update.
+Restoring from an older adapter snapshot cancels only its marked inherited
+hold runs. No policy reserves physical capacity or prevents explicit lifecycle
+operations and host/resource-pressure suspension.
 
 Commands that run at the same time run concurrently: Arker runs one command at
 a time per session, so a command that starts while another is still running
@@ -183,6 +191,28 @@ const exists = await sandbox.filesystem.exists('/tmp/hello.txt');
 await sandbox.filesystem.remove('/tmp/hello.txt');
 ```
 
+### Independent Volumes
+
+Volumes use Arker's object-backed shared filesystems. Their bytes are independent of any one VM, and the same volume can be mounted by multiple VMs.
+
+```typescript
+const volume = await sdk.volume.create({ name: 'dataset' });
+const sandbox = await sdk.instances.create({
+  volumes: [{ volume, mountPath: '/mnt/data' }],
+});
+await sandbox.runCommand('echo retained > /mnt/data/value; sync');
+await sandbox.destroy();
+
+const restored = await sdk.instances.create({
+  volumes: [{ volume, mountPath: '/mnt/data' }],
+});
+console.log((await restored.runCommand('cat /mnt/data/value')).stdout);
+await restored.destroy();
+await sdk.volume.delete(volume.id);
+```
+
+Runtime `attachVolume(volume, mountPath)` and `detachVolume(volume, mountPath)` are supported too. Volume references are filesystem IDs or handles returned by `sdk.volume`. Storage is elastic; `sizeBytes` does not reserve capacity. Read-only mounts are not supported and are rejected before VM creation.
+
 ### Sandbox Management
 
 ```typescript
@@ -204,11 +234,13 @@ await sandbox.destroy();
 
 ## Limitations
 
-- **Creation is fork-only** — direct VM creation is disabled; `create()` forks a golden by name (`templateId`/`source`), an existing VM by id (`snapshotId`) or an OCI image (`image`). There's no separate snapshot store, but any `instanceId` can be re-forked as a `snapshotId`.
 - **Private registries** — `image` is pulled without credentials, so an image must be public.
-- **`getUrl` makes the port public** — it adds an inbound rule that serves the port with no authentication (keeping the VM's other rules) and returns its `https://` URL. For authenticated access, set the VM's network policy through the [Arker SDK](https://github.com/ArkerHQ/arker-sdk) instead.
 - **Volumes mount read-write** — a `readOnly` mount is refused, and `sizeBytes` is ignored: an Arker filesystem grows as it fills. A mount path must be absolute, not `/` and at most 256 bytes, without whitespace, backslashes or `..`. A mount path that goes through a symlink (such as `/var/run/…`, where `/var/run` links to `/run`) takes about two minutes to confirm; give the resolved path (`/run/…`) instead.
 - **One path per volume per sandbox** — a volume mounts at one path on each sandbox, and a sandbox restored from a snapshot keeps its source's mounts. Mounting starts a paused sandbox, as a command would.
+- **Snapshots are VM forks** — the adapter keeps a snapshot as an independent VM handle. Deleting the source sandbox does not delete that snapshot; delete it explicitly when finished.
+- **Snapshot listing** — snapshots created by this adapter are immutable VM forks with durable metadata. Listing supports source filtering and limits; older snapshots without this metadata are not included.
+- **Read-only volumes** — not supported; `readOnly: true` is rejected before creating a VM.
+- **Public ports** — `getUrl` adds a public inbound rule without replacing other policies. Existing higher-precedence deny/authentication rules still apply. If inbound priority zero is already occupied, the adapter refuses to add a lower-precedence rule instead of bypassing it.
 - **`getInfo` status** — always reports `running`; idle sandboxes resume automatically on their next command.
 
 ## Support

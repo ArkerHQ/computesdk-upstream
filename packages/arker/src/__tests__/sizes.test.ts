@@ -7,7 +7,7 @@ const profiles = [['xs', 1, 1024], ['sm', 1, 2048], ['md', 2, 4096], ['lg', 4, 8
 const goldens = { xs: 'ubuntu-coding', sm: 'ubuntu-coding', md: 'ubuntu-coding', lg: 'ubuntu-coding', xl: 'ubuntu-coding-8', '2xl': 'ubuntu-coding-32' };
 
 function mockFork(impl?: () => Promise<VM>) {
-  return vi.spyOn(Arker.prototype, 'fork').mockImplementation(impl ?? (async () => ({ id: 'vm-new' }) as VM));
+  return vi.spyOn(Arker.prototype, 'fork').mockImplementation(impl ?? (async () => ({ id: 'vm-new', listRuns: async () => ({ runs: [] }) }) as unknown as VM));
 }
 const config = { apiKey: 'ark_test', platforms: ['graviton4'], keepAwake: false };
 
@@ -26,6 +26,7 @@ describe('Arker standard size mapping (mock)', () => {
     const result = await arker(config).instances.create({ sizeClass, name: 'job' });
     expect(fork).toHaveBeenCalledWith({
       source_vm_name: goldens[sizeClass], name: 'job', platforms: ['graviton4'], resources: { vcpu, memory_mib: memory },
+      policies: { rules: { 'computesdk-runtime': null, 'computesdk-lifetime': { type: 'schedule', after_created: 300, action: 'delete' } } },
     });
     expect(result.sizing).toEqual({ requested: { sizeClass, vcpus: vcpu, memoryMiB: memory }, resolved: { vcpus: vcpu, memoryMiB: memory }, provenance: 'adapter-declared' });
   });
@@ -56,17 +57,16 @@ describe('Arker standard size mapping (mock)', () => {
       .rejects.toMatchObject({ name: 'InstanceSizeError', code: 'unsupported', fallback: false });
   });
 
-  it('leaves unsized creates unchanged', async () => {
+  it('keeps default resources for unsized creates', async () => {
     const fork = mockFork();
     const result = await arker(config).instances.create({ name: 'plain' });
-    expect(fork.mock.calls[0][0]).toEqual({ source_vm_name: 'ubuntu-small', name: 'plain', platforms: ['graviton4'] });
+    expect(fork.mock.calls[0][0]).toEqual({ source_vm_name: 'ubuntu-small', name: 'plain', platforms: ['graviton4'], policies: { rules: { 'computesdk-runtime': null, 'computesdk-lifetime': { type: 'schedule', after_created: 300, action: 'delete' } } } });
     expect(result.sizing).toBeUndefined();
   });
 });
 
 describe.skipIf(!live)('Arker standard sizes (live)', () => {
-  // The benchmarks pin graviton4; check every size boots at its shape there.
-  const provider = arker({ platforms: ['graviton4'] });
+  const provider = arker({ platforms: process.env.ARKER_PLATFORMS?.split(',') ?? ['graviton4'] });
 
   it.each(profiles)('boots %s at %i vCPU / %i MiB', async (sizeClass, vcpu, memory) => {
     const instance = await provider.instances.create({ sizeClass });

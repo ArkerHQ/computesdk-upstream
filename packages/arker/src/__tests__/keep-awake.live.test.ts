@@ -30,11 +30,11 @@ describe.skipIf(!live)('Arker keep-awake (live)', () => {
       const first = await lines(restored);
       await sleep(3000);
       expect(await lines(restored)).toBeGreaterThanOrEqual(first + 20);
-      // Only the restore's own hold is live: the one copied from the source was ended.
+      // Native runtime rules require no synthetic command in either VM.
       const vm = restored.getInstance() as VM;
       const live = await Promise.all((['pending', 'running'] as const).map((state) => vm.listRuns({ state })));
       const holds = live.flatMap(({ runs }) => runs).filter((r) => r.command?.startsWith(': computesdk-keep-awake'));
-      expect(holds).toHaveLength(1);
+      expect(holds).toHaveLength(0);
     } finally {
       await restored?.destroy().catch(() => {});
       if (snapshotId) await provider.snapshot!.delete(snapshotId).catch(() => {});
@@ -42,22 +42,18 @@ describe.skipIf(!live)('Arker keep-awake (live)', () => {
     }
   }, 120_000);
 
-  it('ends the hold at the sandbox timeout, after which the VM pauses between commands', async () => {
+  it('deletes the sandbox at its server-side deadline', async () => {
     const sandbox = await provider.instances.create({ timeout: 15_000 });
     try {
       await sandbox.runCommand('true');
       const vm = sandbox.getInstance() as VM;
-      const holds = async () => {
-        const live = await Promise.all((['pending', 'running'] as const).map((state) => vm.listRuns({ state })));
-        return live.flatMap(({ runs }) => runs).filter((r) => r.command?.startsWith(': computesdk-keep-awake')).length;
-      };
       await sleep(5_000);
-      expect(await holds()).toBe(1);
-      await sleep(20_000);
-      expect(await holds()).toBe(0);
-      const deadline = Date.now() + 30_000;
-      while ((await vm.refresh()).state !== 'idle' && Date.now() < deadline) await sleep(1_000);
-      expect((await vm.refresh()).state).toBe('idle');
+      expect((await vm.refresh()).vm_id).toBe(sandbox.instanceId);
+      const deadline = Date.now() + 60_000;
+      while (await provider.instances.getById(sandbox.instanceId)) {
+        if (Date.now() > deadline) throw new Error('server-side instance deadline was not enforced');
+        await sleep(1_000);
+      }
     } finally {
       await sandbox.destroy().catch(() => {});
     }
