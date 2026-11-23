@@ -101,7 +101,38 @@ const WRITE_CHUNK_BYTES = 3 * 256 * 1024;
 
 /** Name prefix marking VMs forked by `snapshot.create`. */
 const SNAPSHOT_PREFIX = 'computesdk-snapshot-';
+const SNAPSHOT_KIND = 'computesdk.arker.snapshot';
 const RUNTIME_RULE = 'computesdk-runtime';
+
+interface SnapshotRecord {
+  kind: typeof SNAPSHOT_KIND;
+  version: 1;
+  sourceInstanceId: string;
+  name: string | null;
+  metadata: Record<string, unknown>;
+}
+
+type SnapshotVm = VM & { description?: string | null; immutable?: boolean };
+
+function snapshotRecord(description: string | null | undefined): SnapshotRecord | undefined {
+  if (!description) return undefined;
+  let record: SnapshotRecord;
+  try { record = JSON.parse(description); } catch { return undefined; }
+  if (!record || record.kind !== SNAPSHOT_KIND || record.version !== 1 ||
+      typeof record.sourceInstanceId !== 'string' || !record.sourceInstanceId ||
+      !(record.name === null || typeof record.name === 'string') ||
+      !record.metadata || typeof record.metadata !== 'object' || Array.isArray(record.metadata)) return undefined;
+  return record;
+}
+
+function snapshotInfo(vm: VM, record: SnapshotRecord): ArkerSnapshot {
+  return {
+    id: vm.id,
+    provider: 'arker',
+    createdAt: vm.created_at ? new Date(vm.created_at) : new Date(),
+    metadata: { name: record.name ?? vm.name, sourceInstanceId: record.sourceInstanceId, ...record.metadata },
+  };
+}
 
 export interface ArkerSnapshot {
   /** ID of the forked VM; pass it as `snapshotId` to restore. */
@@ -615,23 +646,62 @@ export const arker = defineProvider<VM, ArkerConfig>({
 
       create: async (config: ArkerConfig, instanceId: string, options?: CreateSnapshotOptions): Promise<ArkerSnapshot> => {
         const client = makeClient(config);
-        const name = `${SNAPSHOT_PREFIX}${options?.name ? `${options.name}-` : ''}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-        const vm = await client.vm(instanceId).fork({
-          name, description: `snapshot of ${instanceId}`,
+        const source = await client.getVm(instanceId);
+        if (!source.vm_id) throw new Error('Arker did not return the canonical source VM ID');
+        const record: SnapshotRecord = {
+          kind: SNAPSHOT_KIND, version: 1, sourceInstanceId: source.vm_id,
+          name: options?.name ?? null, metadata: { ...options?.metadata },
+        };
+        const description = JSON.stringify(record, (_key, value) => {
+          if (value === undefined || typeof value === 'function' || typeof value === 'symbol' ||
+              (typeof value === 'number' && !Number.isFinite(value))) {
+            throw new Error('Arker snapshot metadata must be JSON serializable');
+          }
+          return value;
+        });
+        if (Array.from(description).length > 1024) throw new Error('Arker snapshot metadata exceeds 1024 characters');
+        const persisted = snapshotRecord(description);
+        if (!persisted) throw new Error('Arker snapshot metadata must serialize to a JSON object');
+        const vm = await new VM(client, source.vm_id, source.baseUrl).fork({
+          name: `${SNAPSHOT_PREFIX}${randomUUID()}`, description,
           policies: { rules: { [LIFETIME_RULE]: null, [RUNTIME_RULE]: null } },
         });
-        return {
-          id: vm.id,
-          provider: 'arker',
-          createdAt: vm.created_at ? new Date(vm.created_at) : new Date(),
-          metadata: { name: vm.name ?? name, sourceInstanceId: instanceId, ...options?.metadata },
-        };
+        try {
+          // SDK 1.3 drops immutable from update(); send the canonical patch.
+          const frozen = await vm._client._request<{ immutable?: boolean }>(
+            'PATCH', `/v1/vms/${encodeURIComponent(vm.id)}`, { immutable: true }, vm.baseUrl,
+          );
+          if (frozen.immutable !== true) throw new Error('Arker did not freeze the snapshot');
+        } catch (error) {
+          try { await vm.delete(); } catch (cleanup) {
+            throw Object.assign(new Error('Snapshot freeze and cleanup failed'), { errors: [error, cleanup] });
+          }
+          throw error;
+        }
+        return snapshotInfo(vm, persisted);
       },
 
-      // Snapshot metadata is not a separate backend record; retain the IDs
-      // create() returns rather than relying on a reconstructible inventory.
-      list: async (_config: ArkerConfig, _options?: ListSnapshotsOptions): Promise<ArkerSnapshot[]> => {
-        throw new Error('Arker cannot list snapshots: its VM listing does not identify snapshot forks');
+      list: async (config: ArkerConfig, options?: ListSnapshotsOptions): Promise<ArkerSnapshot[]> => {
+        const client = makeClient(config);
+        const snapshots: ArkerSnapshot[] = [];
+        const sourceId = options?.instanceId ?? options?.sandboxId;
+        let cursor: string | undefined;
+        do {
+          const page = await client.listVms(cursor ? { cursor } : {});
+          for (const listed of page.vms) {
+            let vm = listed as SnapshotVm;
+            let record = snapshotRecord(vm.description);
+            if (!record || (sourceId !== undefined && record.sourceInstanceId !== sourceId)) continue;
+            if (vm.immutable === undefined) {
+              vm = await vm.refresh() as SnapshotVm;
+              record = snapshotRecord(vm.description);
+            }
+            if (!record || vm.immutable !== true || (sourceId !== undefined && record.sourceInstanceId !== sourceId)) continue;
+            snapshots.push(snapshotInfo(vm, record));
+          }
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor);
+        return options?.limit === undefined ? snapshots : snapshots.slice(0, options.limit);
       },
 
       delete: async (config: ArkerConfig, snapshotId: string): Promise<void> => {

@@ -14,7 +14,8 @@ describe('Arker background execution policy', () => {
   });
 
   it('does not leave snapshot records consuming background compute', async () => {
-    const fork = vi.spyOn(VM.prototype, 'fork').mockResolvedValue({ id: 'snapshot-one' } as VM);
+    const fork = vi.spyOn(VM.prototype, 'fork').mockResolvedValue({ id: 'snapshot-one', baseUrl: 'https://example.invalid/api', _client: { _request: vi.fn(async () => ({ immutable: true })) } } as unknown as VM);
+    vi.spyOn(Arker.prototype, 'getVm').mockResolvedValue({ id: 'vm-one', vm_id: 'vm-one', baseUrl: 'https://example.invalid/api' } as unknown as VM);
     await arker({ apiKey: 'ark_test' }).snapshot!.create('vm-one');
     expect(fork).toHaveBeenCalledWith(expect.objectContaining({
       policies: { rules: { 'computesdk-runtime': null, 'computesdk-lifetime': null } },

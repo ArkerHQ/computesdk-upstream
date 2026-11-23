@@ -118,7 +118,7 @@ describe.skipIf(!process.env.ARKER_API_KEY)('Arker focused final verification (l
       expect.soft(before.exitCode).toBe(0);
       expect.soft(Number(before.stdout.trim())).toBeGreaterThan(0);
       console.log('ARKER_FINAL before snapshot', JSON.stringify({ source: sourceVm.id, marker, content }));
-      const snapshot = await provider.snapshot!.create(sourceVm.id);
+      const snapshot = await provider.snapshot!.create(sourceVm.id, { name: `checkpoint-${runId}`, metadata: { nonce: runId } });
       console.log('ARKER_FINAL snapshot', JSON.stringify({ source: sourceVm.id, snapshot: snapshot.id }));
       ids.add(snapshot.id);
       expect(snapshot.id).not.toBe(sourceVm.id);
@@ -135,6 +135,11 @@ describe.skipIf(!process.env.ARKER_API_KEY)('Arker focused final verification (l
       const sourceState = await status(sourceVm._client, sourceVm.id);
       console.log('ARKER_FINAL source deleted before restores', sourceVm.id, sourceState);
       expect(sourceState).toBe('404');
+      const inventory = await arker({ platforms: process.env.ARKER_PLATFORMS?.split(',') }).snapshot!.list({ instanceId: sourceVm.id });
+      expect(inventory).toEqual([snapshot]);
+      const frozen = await sourceVm._client.getVm(snapshot.id);
+      expect((frozen as VM & { immutable?: boolean }).immutable).toBe(true);
+      await expect(frozen.run('printf snapshot-must-not-run')).rejects.toMatchObject({ status: 409, code: 'invalid_state' });
       await observe('snapshot metadata after source deletion', async () => {
         const vm = await sourceVm._client.getVm(snapshot.id);
         return { id: vm.id, state: vm.state, rootSource: vm.root_source_vm_id ?? null };

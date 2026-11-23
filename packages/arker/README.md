@@ -178,7 +178,7 @@ await sandbox.destroy();
 ## Limitations
 
 - **Snapshots are VM forks** — the adapter keeps a snapshot as an independent VM handle. Deleting the source sandbox does not delete that snapshot; delete it explicitly when finished.
-- **Snapshot listing** — not supported; keep the snapshot IDs returned by `snapshot.create()`.
+- **Snapshot listing** — snapshots created by this adapter are immutable VM forks with durable metadata. Listing supports source filtering and limits; older snapshots without this metadata are not included.
 - **Read-only volumes** — not supported; `readOnly: true` is rejected before creating a VM.
 - **Public ports** — `getUrl` adds a public inbound rule without replacing other policies. Existing higher-precedence deny/authentication rules still apply. If inbound priority zero is already occupied, the adapter refuses to add a lower-precedence rule instead of bypassing it.
 - **`getInfo` status** — always reports `running`; idle sandboxes resume automatically on their next command.
