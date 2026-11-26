@@ -69,7 +69,7 @@ describe('Arker native filesystem writes', () => {
       offset += decoded.length;
       expect(chunk.end).toBe(offset);
     }
-    expect(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.content, 'base64')))).toEqual(Buffer.from(content));
+    expect(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.content, 'base64'))).equals(Buffer.from(content))).toBe(true);
     expect(run).not.toHaveBeenCalled();
     expect(sync).toHaveBeenCalledTimes(1);
   });
