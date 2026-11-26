@@ -48,5 +48,15 @@
     "node": ">=22.19.0",
     "pnpm": ">=9.0.0"
   },
-  "packageManager": "pnpm@9.15.0"
+  "packageManager": "pnpm@9.15.0",
+  "pnpm": {
+    "overrides": {
+      "protobufjs@>=7.0.0 <7.6.6": "^7.6.6",
+      "@protobufjs/utf8@<1.1.1": "^1.1.1",
+      "@grpc/grpc-js@<1.13.7": "~1.13.7",
+      "@grpc/grpc-js@>=1.14.0 <1.14.7": "~1.14.7",
+      "smol-toml@<1.9.0": "^1.9.1",
+      "picomatch@<2.3.2": "^2.3.2"
+    }
+  }
 }
